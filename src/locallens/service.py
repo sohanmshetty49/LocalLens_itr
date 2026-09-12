@@ -1,9 +1,13 @@
 from __future__ import annotations
 
+import logging
 import math
 import re
+import time
 from pathlib import Path
 
+from locallens.agent.graph import build_agent_graph
+from locallens.agent.memory import ConversationMemory
 from locallens.cities import CITY_BY_NAME, CITY_CATALOG
 from locallens.config import Settings, get_settings
 from locallens.generation import OllamaClient, compose_answer
@@ -15,6 +19,8 @@ from locallens.schemas import AnswerPayload, PlaceCandidate, PlaceRecord, QueryI
 from locallens.storage import connect, load_chunks, load_places
 from locallens.taxonomy import ACTIVITY_TYPE_QUERIES, PLACE_CATEGORY_QUERIES, TOPICS
 from locallens.utils import read_json, unique_preserve_order
+
+logger = logging.getLogger("locallens.service")
 
 
 TOPIC_KEYWORDS = {
@@ -196,6 +202,12 @@ class LocalLensService:
         self.ollama_client = OllamaClient(self.settings)
         self.google_places = GooglePlacesClient(self.settings.google_maps_api_key)
         self.gallery_images = read_json(self.settings.processed_dir / "gallery_images.json", default={}) or {}
+        # Session-scoped conversation memory (location/topic carry-over across
+        # turns) and the LangGraph orchestrator that chains intent
+        # classification, retrieval, place search, and the broaden-search
+        # decision into explicit, inspectable steps. See src/locallens/agent/.
+        self.memory = ConversationMemory()
+        self._graph = build_agent_graph(self)
 
     def answer(
         self,
@@ -203,92 +215,30 @@ class LocalLensService:
         *,
         location: str = "",
         topic: str = "",
+        session_id: str = "",
     ) -> AnswerPayload:
-        intent = self._infer_intent(query, location=location, topic=topic)
-        unsupported_location = self._unsupported_requested_location(query, intent.location, explicit_location=location)
-        if unsupported_location:
-            return AnswerPayload(
-                answer=(
-                    f"I do not have grounded coverage for {unsupported_location} in the current LocalLens corpus."
-                ),
-                why_this_recommendation=(
-                    "The query names a location that is outside the set of cities and parks currently indexed by the system, "
-                    "so returning a recommendation would risk pulling evidence from the wrong place."
-                ),
-                key_tips=[
-                    "Ask about one of the supported LocalLens destinations.",
-                    "If you want a nearby covered city, try naming it directly.",
-                    "Treat this as a corpus-coverage limit rather than a recommendation."
-                ],
-                confidence_note="Low confidence because the requested location is not available in the current LocalLens corpus.",
-                citations=[],
-                filters_applied={"requested_location": unsupported_location, "coverage": "unsupported"},
-                used_local_llm=False,
-                source_summary="No sources retrieved because the requested location is outside the current corpus.",
-                place_cards=[],
-                gallery_images=[],
-            )
-        retrieval_topic = self._retrieval_topic_for_intent(intent)
-        filters = {
-            "location": intent.location if intent.location and not intent.wants_distance_expansion else "",
-            "topic": retrieval_topic,
-        }
-        retrieval_query = self._expanded_query(query, retrieval_topic or intent.topic, intent.activity_types)
-        place_candidates = self._search_places(intent) if intent.wants_places else []
-        retrieved = []
-        retrieval_filters = {k: v for k, v in filters.items() if v}
-        search_top_k = max(self.settings.top_k * (2 if intent.route == "structured" else 3), self.settings.top_k)
-        candidate_k = max(self.settings.top_k * 2, min(self.settings.candidate_k, 12)) if intent.route == "structured" else self.settings.candidate_k
-        if self.retriever:
-            retrieved = self.retriever.search(
-                retrieval_query,
-                top_k=search_top_k,
-                candidate_k=candidate_k,
-                filters=retrieval_filters,
-            )
-            retrieved = self._prune_retrieved_results(intent, retrieved)
-            retrieved = self._diversify_results(retrieved, limit=self.settings.top_k)
-            if not retrieved and intent.location and retrieval_topic:
-                relaxed_filters = {"location": intent.location} if not intent.wants_distance_expansion else {}
-                retrieved = self.retriever.search(
-                    retrieval_query,
-                    top_k=search_top_k,
-                    candidate_k=candidate_k,
-                    filters=relaxed_filters,
-                )
-                retrieved = self._prune_retrieved_results(intent, retrieved)
-                retrieved = self._diversify_results(retrieved, limit=self.settings.top_k)
-                if retrieved:
-                    retrieval_filters = {
-                        **relaxed_filters,
-                        "topic_relaxed_from": intent.topic,
-                    }
-            elif not retrieved and intent.location:
-                retrieved = self.retriever.search(
-                    retrieval_query,
-                    top_k=search_top_k,
-                    candidate_k=candidate_k,
-                    filters={"location": intent.location} if not intent.wants_distance_expansion else {},
-                )
-                retrieved = self._prune_retrieved_results(intent, retrieved)
-                retrieved = self._diversify_results(retrieved, limit=self.settings.top_k)
-                if retrieved:
-                    retrieval_filters = {
-                        "location_fallback": intent.location,
-                    }
-        if intent.wants_local_knowledge and retrieved and not self._has_high_signal_local_evidence(intent, retrieved):
-            retrieved = []
-        if intent.wants_places and not place_candidates and not self._has_grounded_place_evidence(intent, retrieved):
-            retrieved = []
-        gallery = self._gallery_for(intent.location, place_candidates)
-        return compose_answer(
-            query,
-            retrieved,
-            filters_applied=retrieval_filters,
-            place_candidates=place_candidates,
-            ollama_client=self.ollama_client,
-            gallery_images=gallery,
+        started = time.perf_counter()
+        result = self._graph.invoke(
+            {
+                "query": query,
+                "session_id": session_id or "default",
+                "location": location,
+                "topic": topic,
+            }
         )
+        answer = result["answer"]
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        intent = result.get("intent")
+        logger.info(
+            "answer served in %.1fms | route=%s | citations=%d | place_cards=%d | used_local_llm=%s | sources=%s",
+            elapsed_ms,
+            intent.route if intent else "unsupported_location",
+            len(answer.citations),
+            len(answer.place_cards),
+            answer.used_local_llm,
+            answer.source_summary,
+        )
+        return answer
 
     def stats(self) -> dict[str, object]:
         locations = unique_preserve_order(chunk.location for chunk in self.chunks)
