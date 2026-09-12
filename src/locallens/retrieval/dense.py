@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 
 import numpy as np
 
@@ -8,6 +9,8 @@ from locallens.config import Settings
 from locallens.retrieval.bm25 import match_filters, tokenize
 from locallens.schemas import ChunkRecord, SearchResult
 from locallens.utils import ensure_parent
+
+logger = logging.getLogger("locallens.retrieval.dense")
 
 DEFAULT_QDRANT_BATCH_SIZE = 256
 QDRANT_SEARCH_MIN_LIMIT = 64
@@ -68,8 +71,19 @@ def build_dense_embeddings(
     embedding_backend_name = getattr(embedding_backend, "model_name", "hash")
     matrix = _load_cached_matrix(settings, chunks, embedding_backend_name)
     if matrix is None:
+        logger.debug(
+            "embedding cache miss for %d chunks (backend=%s); encoding from scratch",
+            len(chunks),
+            embedding_backend_name,
+        )
         chunk_texts = [_document_text(chunk) for chunk in chunks]
         matrix = embedding_backend.encode(chunk_texts)
+    else:
+        logger.debug(
+            "embedding cache hit for %d chunks (backend=%s); skipping re-encoding",
+            len(chunks),
+            embedding_backend_name,
+        )
 
     if settings.vector_backend == "qdrant":
         try:
